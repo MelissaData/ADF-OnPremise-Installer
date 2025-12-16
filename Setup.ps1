@@ -100,6 +100,9 @@ $dotnetFramework35CabLocalPath  = Join-Path $dotnetFramework35Dir "microsoft-win
 
 $smartMoverExportsDir           = "C:\SmartMoverExports"
 
+# Destination for EVC data files
+$dqtDataDir                     = "C:\Program Files\Melissa DATA\DQT\Data"
+
 # ============================================================================
 # Create Local Directories
 # ============================================================================
@@ -107,6 +110,7 @@ New-Item -ItemType Directory -Force -Path $setupDir                 | Out-Null
 New-Item -ItemType Directory -Force -Path $logDir                   | Out-Null
 New-Item -ItemType Directory -Force -Path $dotnetFramework35Dir     | Out-Null
 New-Item -ItemType Directory -Force -Path $smartMoverExportsDir     | Out-Null
+New-Item -ItemType Directory -Force -Path $dqtDataDir               | Out-Null
 
 # ============================================================================
 # Blob Paths
@@ -121,7 +125,8 @@ $installerLogsUploadUrl             = "https://$storageAccount.blob.core.windows
 # ============================================================================
 Function Write-Log {
     param ([string]$Message)
-    $logTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+    $logTime  = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $logEntry = "$logTime - $Message"
     $logEntry | Out-File -Append -FilePath $customSetupLogFile
 
@@ -129,10 +134,12 @@ Function Write-Log {
         Invoke-RestMethod -Uri $customSetupLogsUploadUrl -Method Put -InFile $customSetupLogFile -ContentType "text/plain" -Headers @{ "x-ms-blob-type" = "BlockBlob" }
     }
     catch {
-        Write-Host "Failed to upload main log file: $($_.Exception.Message)" -ForegroundColor Red
-        Exit 1
+        # IMPORTANT: logging failure should NOT kill the setup
+        Write-Host "WARNING: Failed to upload main log file: $($_.Exception.Message)" -ForegroundColor Yellow
+        # no Exit here
     }
 }
+
 
 # ============================================================================
 # Helper function to upload a log file via a temporary copy
@@ -145,11 +152,12 @@ Function Upload-Installer-LogFile {
         return $true
     }
     catch {
-        Write-Log "Failed to upload installer log from temporary file: $($_.Exception.Message)"
+        # Log a warning but don't fail the whole setup
+        Write-Log "WARNING: Failed to upload installer log from temporary file: $($_.Exception.Message)"
         return $false
-        Exit 1
     }
 }
+
 
 # ============================================================================
 # Main Execution Block
@@ -275,7 +283,95 @@ try {
     Write-Log "$webInstallerName.exe installation completed with Exit Code: $($global:InstallerProcess.ExitCode)"
 
     # ------------------------------------------------------------------------
-    # Step 5: Prepare Contact Verify Config File
+    # Step 5: Copy EVC DataPath files to DQT Data
+    # ------------------------------------------------------------------------
+    try {
+        $evcDataSourcePath = [string](Join-Path $uncRoot $folderMapping['EVC_DataPath'])
+        Write-Log "Preparing to synchronize EVC data from '$evcDataSourcePath' to '$dqtDataDir'..."
+
+        if (-not (Test-Path $evcDataSourcePath)) {
+            Write-Log "ERROR: EVC_DataPath source not found: $evcDataSourcePath"
+            throw "EVC_DataPath source directory does not exist."
+        }
+
+        # Enumerate files
+        $files  = Get-ChildItem -Path $evcDataSourcePath -Recurse -File -ErrorAction Stop
+        $total  = $files.Count
+        Write-Log "Discovered $total file(s) under EVC_DataPath:"
+        foreach ($f in $files) { Write-Log " - $($f.FullName)" }
+
+        if ($total -eq 0) {
+            Write-Log "No files to copy from '$evcDataSourcePath'. Continuing..."
+        }
+        else {
+            # Buffer for copied-file log messages and 30-second flush timer
+            $copiedSinceLastFlush = [System.Collections.Generic.List[string]]::new()
+            $lastFlushTime        = Get-Date
+
+            # Helper: flush buffered copy logs if any
+            function Flush-CopiedFilesLog {
+                param (
+                    [System.Collections.Generic.List[string]]$BufferRef,
+                    [ref]$LastFlushRef
+                )
+
+                if ($BufferRef.Count -gt 0) {
+                    foreach ($msg in $BufferRef) {
+                        Write-Log $msg
+                    }
+                    $BufferRef.Clear()
+                    $LastFlushRef.Value = Get-Date
+                }
+            }
+
+            # Copy with buffered logging
+            for ($i = 0; $i -lt $total; $i++) {
+                $file = $files[$i]
+                $rel  = $file.FullName.Substring($evcDataSourcePath.Length).TrimStart('\','/')
+
+                $destFile = Join-Path $dqtDataDir $rel
+                $destDir  = Split-Path -Parent $destFile
+                if (-not (Test-Path $destDir)) {
+                    New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+                }
+
+                $idx = $i + 1
+                try {
+                    Copy-Item -Path $file.FullName -Destination $destFile -Force -ErrorAction Stop
+
+                    # Store success message in memory (do not log immediately)
+                    $message = "[$idx/$total] Copied '$rel' --> '$destFile'"
+                    $copiedSinceLastFlush.Add($message) | Out-Null
+
+                    # Every 30 seconds, flush any new copied-file logs
+                    $now = Get-Date
+                    if (($now - $lastFlushTime).TotalSeconds -ge 30) {
+                        Flush-CopiedFilesLog -BufferRef $copiedSinceLastFlush -LastFlushRef ([ref]$lastFlushTime)
+                    }
+                }
+                catch {
+                    # Errors are still logged immediately
+                    Write-Log "[$idx/$total] ERROR copying '$rel' - $($_.Exception.Message)"
+                    # Continue to next file instead of aborting entire setup
+                }
+            }
+
+            # After the last file is copied, flush whatever is left immediately
+            if ($copiedSinceLastFlush.Count -gt 0) {
+                Flush-CopiedFilesLog -BufferRef $copiedSinceLastFlush -LastFlushRef ([ref]$lastFlushTime)
+            }
+
+            Write-Log "Completed copying $total file(s) to '$dqtDataDir'."
+        }
+    }
+    catch {
+        Write-Log "ERROR during EVC data copy - $_"
+        # Do not Exit 1; proceed so the rest of setup/logging can complete
+    }
+
+
+    # ------------------------------------------------------------------------
+    # Step 6: Prepare Contact Verify Config File
     # ------------------------------------------------------------------------
     Write-Log "----- Preparing Contact Verify Config File -----"
     $configPath                         = "C:\ProgramData\Melissa DATA\EVC\EVC.SSIS.Config"
@@ -335,28 +431,6 @@ try {
             Write-Log "Contact Verify - Added new MailboxLookupMode node with value 'Express' and saved the file."
         }
 
-        # --- Update DataPath ---
-        if ($configXml.EVC.DataPath) {
-            $currentDataPath = $configXml.EVC.DataPath
-
-            if ($currentDataPath -eq $contactVerifyTargetDataPath) {
-                Write-Log "Contact Verify - No change needed. DataPath already set to '$contactVerifyTargetDataPath'."
-            } else {
-                Write-Log "Contact Verify - Current DataPath is '$currentDataPath'. Updating to '$contactVerifyTargetDataPath'..."
-                $configXml.EVC.DataPath = $contactVerifyTargetDataPath
-                $configXml.Save($configPath)
-                Write-Log "Contact Verify - Updated DataPath to '$contactVerifyTargetDataPath' and saved the file."
-            }
-        }
-        else {
-            Write-Log "Contact Verify - DataPath tag not found. Creating new <DataPath>$contactVerifyTargetDataPath</DataPath> node..."
-            $newNode = $configXml.CreateElement("DataPath")
-            $newNode.InnerText = $contactVerifyTargetDataPath
-            $configXml.EVC.AppendChild($newNode) | Out-Null
-            $configXml.Save($configPath)
-            Write-Log "Contact Verify - Added new DataPath node with value '$contactVerifyTargetDataPath' and saved the file."
-        }
-
         # --- Update GeoLoggingPath ---
         if ($configXml.EVC.GeoLoggingPath) {
             $currentGeoLoggingPath = $configXml.EVC.GeoLoggingPath
@@ -385,9 +459,9 @@ try {
         Exit 1
     }
 
-    # ------------------------------------------------------------------------
-    # Step 6: Prepare MatchUp Config File
-    # ------------------------------------------------------------------------
+    # # ------------------------------------------------------------------------
+    # # Step 7: Prepare MatchUp Config File
+    # # ------------------------------------------------------------------------
     Write-Log "----- Preparing MatchUp Config File -----"
     $matchupConfigPath      = "C:\ProgramData\Melissa DATA\MatchUP\MatchUP.SSIS.Config"
     $matchupTargetDataPath  = [string](Join-Path $uncRoot $folderMapping['MatchUP'])
@@ -427,9 +501,9 @@ try {
         Exit 1
     }
 
-    # ------------------------------------------------------------------------
-    # Step 7: Prepare Profiler Config File
-    # ------------------------------------------------------------------------
+    # # ------------------------------------------------------------------------
+    # # Step 8: Prepare Profiler Config File
+    # # ------------------------------------------------------------------------
     Write-Log "----- Preparing Profiler DataPath -----"
     $profilerConfigPath     = "C:\ProgramData\Melissa DATA\Profiler\Profiler.SSIS.Config"
     $profilerTargetDataPath = [string](Join-Path $uncRoot $folderMapping['Profiler'])
@@ -469,9 +543,9 @@ try {
         Exit 1
     }
 
-    # ------------------------------------------------------------------------
-    # Step 8: Prepare Cleanser Config File
-    # ------------------------------------------------------------------------
+    # # ------------------------------------------------------------------------
+    # # Step 9: Prepare Cleanser Config File
+    # # ------------------------------------------------------------------------
     Write-Log "----- Preparing Cleanser Config File -----"
     $cleanserConfigPath      = "C:\ProgramData\Melissa DATA\Cleanser\Cleanser.SSIS.Config"
     $cleanserTargetDataPath  = [string](Join-Path $uncRoot $folderMapping['Cleanser'])
@@ -512,23 +586,24 @@ try {
     }
 
     # ------------------------------------------------------------------------
-    # Step 9: Final upload of main log
+    # Step 10: Final upload of main log
     # ------------------------------------------------------------------------
-    Write-Log "Setup Script Completed. Final log upload..."
+    Write-Log "Setup Script Completed. Final log upload attempt..."
     try {
         Invoke-RestMethod -Uri $customSetupLogsUploadUrl -Method Put -InFile $customSetupLogFile -ContentType "text/plain" -Headers @{ "x-ms-blob-type" = "BlockBlob" }
-        Write-Log "Final main log uploaded successfully."
+        Write-Log "Final main log upload attempt finished."
     }
     catch {
-        Write-Log "ERROR: Failed final log upload - $_"
-        Exit 1
+        # Just record the error; do NOT fail the setup for log upload issues
+        Write-Log "WARNING: Final main log upload failed - $($_.Exception.Message)"
     }
+
 
 }
 catch {
     Write-Log "FATAL ERROR: $_"
-    throw $_
     Exit 1
 }
+
 
 Write-Host "Setup Script Completed Successfully!"
