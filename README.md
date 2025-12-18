@@ -130,6 +130,9 @@ Contact Verify directory:
 > **Tip:**  
 > Contact Verify data files are updated monthly. You can reuse this same method to keep your data files *up to date*.
 
+> <span style="color:red"><strong>IMPORTANT NOTES:</strong><br>
+> If you plan to use the Geocoding feature in the Contact Verify component, the setup process will be different. Please contact your sales representative, who can connect you with one of our engineers to assist you with the setup.</span>
+
 ---
 
 ### Step 5: Verify All Data Files Are in Place
